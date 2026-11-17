@@ -5,7 +5,9 @@ import base64
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import subprocess
 import time
+from types import SimpleNamespace
 import urllib.parse
 import uuid
 
@@ -147,7 +149,11 @@ def notebook_definition(path, state):
     notebook = nbformat.v4.new_notebook(
         cells=[
             nbformat.v4.new_markdown_cell(
-                f"# {path.stem.replace('_', ' ')}\nSource: {CONFIG['repository']}"
+                f"# {path.stem.replace('_', ' ')}\nSource owner: {CONFIG['owner']}"
+            ),
+            nbformat.v4.new_code_cell(
+                f"owner = {json.dumps(CONFIG['owner'])}",
+                metadata={"tags": ["parameters"]},
             ),
             nbformat.v4.new_code_cell(source),
         ],
@@ -197,36 +203,37 @@ def deploy(_args):
         print(f"Deployed {name}: {item['id']}", flush=True)
 
 
-def stage(_args):
-    state = load()
-    api = Fabric()
-    repository = CONFIG["repository"]
-    batch = uuid.uuid4().hex
-    captured = datetime.now(timezone.utc).isoformat()
-    rows = []
-    counts = {}
-    for entity, endpoint, key in [
-        ("repositories", "", "id"),
-        ("commits", "/commits?per_page=100", "sha"),
-        ("issues", "/issues?state=all&per_page=100", "id"),
-        ("pull_requests", "/pulls?state=all&per_page=100", "id"),
-    ]:
-        url = f"repos/{repository}{endpoint}"
-        if not endpoint:
-            objects = [command_json(["gh", "api", url])]
-            if objects[0]["private"]:
-                raise ValueError("This public-data POC does not ingest private repositories")
-        else:
-            pages = command_json(["gh", "api", "--paginate", "--slurp", url])
-            objects = [item for page in pages for item in page]
-        counts[entity] = len(objects)
-        for item in objects:
-            rows.append({
-                "entity": entity, "record_id": str(item[key]),
-                "payload": json.dumps(item, separators=(",", ":")),
-                "source_url": f"https://api.github.com/{url}",
-                "batch_id": batch, "ingested_at": captured,
-            })
+def eligible_repository(repository, owner):
+    return (
+        repository["private"] is False
+        and repository["fork"] is False
+        and repository["owner"]["login"].lower() == owner.lower()
+    )
+
+
+def github_pages(endpoint, allow_empty_repository=False):
+    try:
+        pages = command_json(["gh", "api", "--paginate", "--slurp", endpoint])
+    except subprocess.CalledProcessError as error:
+        # A truly empty repository has no commits endpoint result. Do not mask
+        # permission, throttling, network or any other GitHub failures.
+        if allow_empty_repository:
+            try:
+                body = json.loads(error.stdout)
+            except json.JSONDecodeError:
+                raise error
+            if isinstance(body, list) and len(body) == 1:
+                body = body[0]
+            if isinstance(body, dict) and body.get("message") == "Git Repository is empty." and str(
+                body.get("status")
+            ) == "409":
+                print(f"{endpoint}: empty repository (0 commits)", flush=True)
+                return []
+        raise
+    return [item for page in pages for item in page]
+
+
+def files_url(api, state):
     lakehouse = api.call(
         "GET", f"/workspaces/{state['workspace_id']}/lakehouses/{state['lakehouse_id']}"
     )
@@ -236,7 +243,64 @@ def stage(_args):
         files = f"https://{parsed.hostname}/{parsed.username}{parsed.path}"
     if not files.startswith("https://"):
         raise RuntimeError(f"Unsupported OneLake files path: {files}")
-    directory = files.rstrip("/") + f"/github/{batch}"
+    return files.rstrip("/")
+
+
+def discover(_args):
+    run(SimpleNamespace(notebook=["00_discover_repositories"]))
+
+
+def stage(_args):
+    state = load()
+    api = Fabric()
+    files = files_url(api, state)
+    inventory = api.request(
+        "GET", files + "/github/repository_inventory.json",
+        resource="https://storage.azure.com",
+    )[2]
+    if inventory["owner"].lower() != CONFIG["owner"].lower():
+        raise ValueError("Repository inventory belongs to a different owner; run discover")
+    repositories = inventory["repositories"]
+    if not repositories or len(repositories) != inventory["repository_count"]:
+        raise ValueError("Repository inventory is empty or incomplete; run discover")
+    if len({repository["id"] for repository in repositories}) != len(repositories):
+        raise ValueError("Repository inventory has duplicate IDs; run discover")
+    batch = uuid.uuid4().hex
+    captured = datetime.now(timezone.utc).isoformat()
+    rows = []
+    counts = dict.fromkeys(("repositories", "commits", "issues", "pull_requests"), 0)
+    repository_counts = {}
+    for descriptor in repositories:
+        repository = descriptor["full_name"]
+        details = command_json(["gh", "api", f"repos/{repository}"])
+        if details["id"] != descriptor["id"] or not eligible_repository(
+            details, CONFIG["owner"]
+        ):
+            raise ValueError(f"{repository} is no longer eligible; re-run discovery")
+        per_repository = {}
+        for entity, endpoint, key in [
+            ("repositories", "", "id"),
+            ("commits", "/commits?per_page=100", "sha"),
+            ("issues", "/issues?state=all&per_page=100", "id"),
+            ("pull_requests", "/pulls?state=all&per_page=100", "id"),
+        ]:
+            url = f"repos/{repository}{endpoint}"
+            objects = [details] if not endpoint else github_pages(
+                url, allow_empty_repository=(entity == "commits")
+            )
+            per_repository[entity] = len(objects)
+            counts[entity] += len(objects)
+            for item in objects:
+                rows.append({
+                    "repository_id": details["id"], "entity": entity,
+                    "record_id": str(item[key]),
+                    "payload": json.dumps(item, separators=(",", ":")),
+                    "source_url": f"https://api.github.com/{url}",
+                    "batch_id": batch, "ingested_at": captured,
+                })
+        repository_counts[str(details["id"])] = per_repository
+        print(f"{repository}: {json.dumps(per_repository)}", flush=True)
+    directory = files + f"/github/{batch}"
 
     def upload(path, data):
         api.request("PUT", path + "?resource=file", raw=b"",
@@ -253,8 +317,10 @@ def stage(_args):
     upload(directory + "/records.jsonl",
            ("\n".join(json.dumps(row) for row in rows) + "\n").encode())
     manifest = {
-        "batch_id": batch, "ingested_at": captured, "repository": repository,
-        "counts": counts, "record_count": len(rows),
+        "batch_id": batch, "ingested_at": captured, "owner": CONFIG["owner"],
+        "discovery_run_id": inventory["discovery_run_id"],
+        "repository_count": len(repositories), "repositories": repositories,
+        "repository_counts": repository_counts, "counts": counts, "record_count": len(rows),
     }
     upload(directory + "/manifest.json", json.dumps(manifest).encode())
     # Only publish the batch pointer after every source page and upload succeeded.
@@ -268,7 +334,7 @@ def run(args):
     state = load()
     api = Fabric("spark-cli")
     workspace = f"/workspaces/{state['workspace_id']}"
-    selected = args.notebook or sorted(state["notebooks"])
+    selected = args.notebook or ["01_bronze", "02_silver", "03_gold"]
     for name in selected:
         item = state["notebooks"][name]
         path = workspace + f"/items/{item}/jobs/instances"
@@ -376,6 +442,7 @@ if __name__ == "__main__":
     commands.add_parser("bootstrap")
     commands.add_parser("deploy")
     commands.add_parser("stage")
+    commands.add_parser("discover")
     execute = commands.add_parser("run")
     execute.add_argument("--notebook", action="append")
     commands.add_parser("status")

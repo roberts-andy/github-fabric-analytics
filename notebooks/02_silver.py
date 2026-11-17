@@ -42,14 +42,16 @@ def parse(entity):
     return (
         raw.where(F.col("entity") == entity)
         .withColumn("data", F.from_json("payload", schemas[entity]))
-        .select("data.*", "batch_id", "ingested_at", "payload", "source_url")
+        .select(
+            "data.*", F.col("repository_id").alias("source_repository_id"),
+            "batch_id", "ingested_at", "payload", "source_url",
+        )
     )
 
 
 repository = parse("repositories")
-repository_id = repository.select("id").first()["id"]
-if repository_id is None:
-    raise ValueError("Repository ID is missing")
+if repository.count() != latest["repository_count"]:
+    raise ValueError("Silver source does not cover the repository inventory")
 
 frames = {
     "repositories": repository.select(
@@ -59,7 +61,8 @@ frames = {
         "batch_id", "ingested_at",
     ),
     "commits": parse("commits").select(
-        F.col("sha").alias("commit_sha"), F.lit(repository_id).alias("repository_id"),
+        F.col("sha").alias("commit_sha"),
+        F.col("source_repository_id").alias("repository_id"),
         F.coalesce(F.col("author.login"), F.lit("unlinked")).alias("actor_login"),
         F.col("commit.author.date").alias("created_at"),
         F.col("commit.message").alias("message"), "html_url", "batch_id", "ingested_at",
@@ -71,7 +74,8 @@ for entity in ("issues", "pull_requests"):
         # GitHub's issues endpoint returns both issues and pull requests.
         parsed = parsed.where(F.col("pull_request").isNull())
     columns = [
-        F.col("id").alias("item_id"), F.lit(repository_id).alias("repository_id"),
+        F.col("id").alias("item_id"),
+        F.col("source_repository_id").alias("repository_id"),
         "number", "title", "state",
         F.coalesce(F.col("user.login"), F.lit("unlinked")).alias("actor_login"),
         "created_at", "updated_at", "closed_at",
@@ -83,18 +87,22 @@ for entity in ("issues", "pull_requests"):
 rules = {
     "repositories": "repository_id IS NOT NULL AND full_name IS NOT NULL "
                     "AND stars >= 0 AND forks >= 0 AND created_at IS NOT NULL",
-    "commits": "commit_sha RLIKE '^[a-f0-9]{40,64}$' AND created_at IS NOT NULL",
-    "issues": "item_id IS NOT NULL AND number > 0 AND state IN ('open','closed') "
+    "commits": "repository_id IS NOT NULL AND "
+               "commit_sha RLIKE '^[a-f0-9]{40,64}$' AND created_at IS NOT NULL",
+    "issues": "repository_id IS NOT NULL AND item_id IS NOT NULL "
+              "AND number > 0 AND state IN ('open','closed') "
               "AND created_at IS NOT NULL AND updated_at >= created_at "
               "AND (closed_at IS NULL OR closed_at >= created_at)",
-    "pull_requests": "item_id IS NOT NULL AND number > 0 AND state IN ('open','closed') "
+    "pull_requests": "repository_id IS NOT NULL AND item_id IS NOT NULL "
+                     "AND number > 0 AND state IN ('open','closed') "
                      "AND created_at IS NOT NULL AND updated_at >= created_at "
                      "AND (closed_at IS NULL OR closed_at >= created_at) "
                      "AND (merged_at IS NULL OR merged_at >= created_at)",
 }
 key_columns = {
-    "repositories": "repository_id", "commits": "commit_sha",
-    "issues": "item_id", "pull_requests": "item_id",
+    "repositories": ["repository_id"], "commits": ["repository_id", "commit_sha"],
+    "issues": ["repository_id", "item_id"],
+    "pull_requests": ["repository_id", "item_id"],
 }
 metrics = {}
 for entity, frame in frames.items():
@@ -113,7 +121,7 @@ for entity, frame in frames.items():
         )
         raise ValueError(f"{entity}: {rejected_count} invalid rows; see silver.quality_rejects")
     sort = [F.col("updated_at").desc()] if "updated_at" in frame.columns else []
-    window = Window.partitionBy(key_columns[entity]).orderBy(
+    window = Window.partitionBy(*key_columns[entity]).orderBy(
         *sort, F.col("ingested_at").desc()
     )
     cleaned = (
@@ -121,7 +129,9 @@ for entity, frame in frames.items():
     )
     # This small-repository POC replaces the complete current snapshot, including
     # valid empty tables; Bronze retains every historical capture.
-    cleaned.write.format("delta").mode("overwrite").saveAsTable(f"silver.{entity}")
+    cleaned.write.format("delta").mode("overwrite").option(
+        "overwriteSchema", "true"
+    ).saveAsTable(f"silver.{entity}")
     spark.sql(f"OPTIMIZE silver.{entity}")
     actual = spark.table(f"silver.{entity}").count()
     expected = cleaned.count()

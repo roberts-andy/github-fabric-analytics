@@ -22,8 +22,8 @@ for entity in ("repositories", "commits", "issues", "pull_requests"):
         raise ValueError(f"Stale Silver batch in {entity}")
     if sources[entity].count() != silver_metrics[entity]["rows"]:
         raise ValueError(f"Incomplete Silver table: {entity}")
-if sources["repositories"].count() != 1:
-    raise ValueError("Gold expects one current repository")
+if sources["repositories"].count() != latest["repository_count"]:
+    raise ValueError("Gold source does not cover the complete repository inventory")
 
 repository = sources["repositories"]
 tables = {
@@ -98,6 +98,7 @@ snapshots = (
         F.col("data.stargazers_count").alias("stars"),
         F.col("data.forks_count").alias("forks"),
     )
+    .join(repository.select("repository_id"), "repository_id", "inner")
 )
 window = Window.partitionBy("repository_id", "date").orderBy(
     F.col("ingested_at").desc(), F.col("batch_id").desc()
@@ -138,7 +139,9 @@ for entity in ("commits", "issues", "pull_requests"):
 # Small dimensions and full source snapshots are deliberately unpartitioned;
 # incremental partition rewrites would add overhead without saving work here.
 for name, frame in tables.items():
-    frame.write.format("delta").mode("overwrite").saveAsTable(f"gold.{name}")
+    frame.write.format("delta").mode("overwrite").option(
+        "overwriteSchema", "true"
+    ).saveAsTable(f"gold.{name}")
     spark.sql(f"OPTIMIZE gold.{name}")
     if spark.table(f"gold.{name}").count() != metrics[name]:
         raise ValueError(f"Persisted count mismatch in gold.{name}")

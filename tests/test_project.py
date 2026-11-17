@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -49,7 +50,8 @@ class ProjectTests(unittest.TestCase):
             notebook = nbformat.read(root / ".local" / "layer.ipynb", as_version=4)
             nbformat.validate(notebook)
             self.assertEqual(result["format"], "ipynb")
-            cell = notebook.cells[1]
+            self.assertEqual(notebook.cells[1].metadata.tags, ["parameters"])
+            cell = notebook.cells[2]
             self.assertEqual(cell.outputs, [])
             self.assertIsNone(cell.execution_count)
             self.assertEqual(cell.source, "first = 1\nsecond = 2\n")
@@ -78,9 +80,84 @@ class ProjectTests(unittest.TestCase):
         with patch.object(project, "load", return_value=state), \
                 patch.object(project, "save"), \
                 patch.object(project, "Fabric", return_value=api):
-            project.run(SimpleNamespace(notebook=None))
+            project.run(SimpleNamespace(notebook=["01_bronze"]))
         api.request.assert_not_called()
         self.assertEqual(state["jobs"]["01_bronze"], "existing-job")
+
+    def test_inventory_eligibility_excludes_forks_private_and_other_owners(self):
+        repository = {
+            "private": False, "fork": False, "owner": {"login": "Example"},
+            "archived": True,
+        }
+        self.assertTrue(project.eligible_repository(repository, "example"))
+        for overrides in [
+            {"private": True}, {"fork": True}, {"owner": {"login": "someone-else"}},
+        ]:
+            with self.subTest(overrides=overrides):
+                self.assertFalse(project.eligible_repository(
+                    {**repository, **overrides}, "example"
+                ))
+
+    def test_empty_repository_does_not_hide_other_github_errors(self):
+        body = {"message": "Git Repository is empty.", "status": "409"}
+        for response in (body, [body]):
+            empty = subprocess.CalledProcessError(1, "gh", output=json.dumps(response))
+            with self.subTest(response=response), \
+                    patch.object(project, "command_json", side_effect=empty):
+                self.assertEqual(project.github_pages("/commits", True), [])
+        forbidden = subprocess.CalledProcessError(
+            1, "gh", output=json.dumps({"message": "Forbidden", "status": "403"})
+        )
+        with patch.object(project, "command_json", side_effect=forbidden):
+            with self.assertRaises(subprocess.CalledProcessError):
+                project.github_pages("/commits", True)
+
+    def test_github_pages_flattens_every_page(self):
+        pages = [[{"sha": "first"}], [{"sha": "second"}]]
+        with patch.object(project, "command_json", return_value=pages):
+            self.assertEqual(
+                project.github_pages("/commits"),
+                [{"sha": "first"}, {"sha": "second"}],
+            )
+
+    def test_staging_uses_inventory_and_preserves_shared_commits_per_repository(self):
+        descriptors = [
+            {"id": 1, "full_name": "example/one"},
+            {"id": 2, "full_name": "example/two"},
+        ]
+        inventory = {
+            "owner": "example", "repository_count": 2, "repositories": descriptors,
+            "discovery_run_id": "scan",
+        }
+        details = [
+            {**value, "private": False, "fork": False, "owner": {"login": "example"}}
+            for value in descriptors
+        ]
+        api = Mock()
+        api.request.side_effect = lambda method, *args, **kwargs: (
+            (200, {}, inventory) if method == "GET" else (201, {}, None)
+        )
+        shared = {"sha": "a" * 40}
+        with patch.object(project, "load", return_value={}), \
+                patch.object(project, "save"), \
+                patch.object(project, "CONFIG", {"owner": "example"}), \
+                patch.object(project, "Fabric", return_value=api), \
+                patch.object(project, "files_url", return_value="https://example.test/Files"), \
+                patch.object(project, "command_json", side_effect=details), \
+                patch.object(project, "github_pages", side_effect=[
+                    [shared], [], [], [shared], [], [],
+                ]):
+            project.stage(SimpleNamespace())
+        payload = next(
+            call.kwargs["raw"] for call in api.request.call_args_list
+            if call.args[0] == "PATCH" and "/records.jsonl?action=append" in call.args[1]
+        )
+        commits = [
+            record for line in payload.decode().splitlines()
+            if (record := json.loads(line))["entity"] == "commits"
+        ]
+        self.assertEqual({record["repository_id"] for record in commits}, {1, 2})
+        self.assertEqual({record["record_id"] for record in commits}, {"a" * 40})
 
 
 if __name__ == "__main__":
