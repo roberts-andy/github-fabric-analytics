@@ -1,0 +1,151 @@
+{
+  "name": "GitHub Analytics",
+  "compatibilityLevel": 1702,
+  "model": {
+    "description": "GitHub activity from Gold Delta tables. Date slices activity creation cohorts, issue states are current, and repository counters are last-observed snapshots.",
+    "culture": "en-US",
+    "defaultPowerBIDataSourceVersion": "powerBI_V3",
+    "discourageImplicitMeasures": true,
+    "sourceQueryCulture": "en-US",
+    "directLakeBehavior": "directLakeOnly",
+    "tables": [
+      {
+        "name": "Repository",
+        "description": "One row per analyzed GitHub repository, with current descriptive attributes.",
+        "columns": [
+          {"name": "Repository Id", "dataType": "int64", "isHidden": true, "sourceColumn": "repository_id", "summarizeBy": "none"},
+          {"name": "Repository", "dataType": "string", "description": "GitHub owner/repository identifier.", "sourceColumn": "repository_name", "summarizeBy": "none"},
+          {"name": "Repository Url", "dataType": "string", "description": "Public GitHub repository page.", "sourceColumn": "html_url", "dataCategory": "WebUrl", "summarizeBy": "none"},
+          {"name": "Description", "dataType": "string", "description": "Current repository description from GitHub.", "sourceColumn": "description", "summarizeBy": "none"},
+          {"name": "Default Branch", "dataType": "string", "description": "Branch whose commit history is collected.", "sourceColumn": "default_branch", "summarizeBy": "none"},
+          {"name": "Language", "dataType": "string", "description": "Primary repository language reported by GitHub; blank until GitHub detects it.", "sourceColumn": "language", "summarizeBy": "none"}
+        ],
+        "partitions": [{"name": "Repository", "mode": "directLake", "source": {"type": "entity", "entityName": "dim_repository", "expressionSource": "DirectLake - GitHub Analytics", "schemaName": "gold"}}]
+      },
+      {
+        "name": "Author",
+        "description": "Distinct observed GitHub logins. The unlinked member represents commits or items without an associated GitHub account.",
+        "columns": [
+          {"name": "GitHub Login", "dataType": "string", "description": "GitHub login of the commit author or issue/pull-request creator; unlinked means unavailable.", "sourceColumn": "actor_login", "summarizeBy": "none"}
+        ],
+        "partitions": [{"name": "Author", "mode": "directLake", "source": {"type": "entity", "entityName": "dim_actor", "expressionSource": "DirectLake - GitHub Analytics", "schemaName": "gold"}}]
+      },
+      {
+        "name": "Date",
+        "description": "Contiguous UTC calendar. Filters activity by commit author date or issue/pull-request creation date, and repository observations by capture date.",
+        "dataCategory": "Time",
+        "columns": [
+          {"name": "Date", "dataType": "dateTime", "description": "UTC calendar date.", "isUnique": true, "sourceColumn": "date", "formatString": "yyyy-MM-dd", "summarizeBy": "none"},
+          {"name": "Year", "dataType": "int64", "description": "Calendar year.", "sourceColumn": "year", "summarizeBy": "none"},
+          {"name": "Quarter", "dataType": "int64", "description": "Calendar quarter, 1 through 4.", "sourceColumn": "quarter", "summarizeBy": "none"},
+          {"name": "Month Number", "dataType": "int64", "isHidden": true, "sourceColumn": "month_number", "summarizeBy": "none"},
+          {"name": "Month", "dataType": "string", "description": "Calendar month name, sorted by month number.", "sourceColumn": "month_name", "sortByColumn": "Month Number", "summarizeBy": "none"},
+          {"name": "Year Month", "dataType": "string", "description": "Sortable year-month label in yyyy-MM format.", "sourceColumn": "year_month", "summarizeBy": "none"},
+          {"name": "Day of Week", "dataType": "string", "description": "Weekday name; the week starts on Sunday.", "sourceColumn": "day_of_week", "sortByColumn": "Day of Week Number", "summarizeBy": "none"},
+          {"name": "Day of Week Number", "dataType": "int64", "isHidden": true, "sourceColumn": "day_of_week_number", "summarizeBy": "none"}
+        ],
+        "partitions": [{"name": "Date", "mode": "directLake", "source": {"type": "entity", "entityName": "dim_date", "expressionSource": "DirectLake - GitHub Analytics", "schemaName": "gold"}}]
+      },
+      {
+        "name": "Commits",
+        "description": "One row per current default-branch commit. Dates use the Git commit author timestamp, not push time.",
+        "columns": [
+          {"name": "Repository Id", "dataType": "int64", "isHidden": true, "sourceColumn": "repository_id", "summarizeBy": "none"},
+          {"name": "Author Login", "dataType": "string", "isHidden": true, "sourceColumn": "actor_login", "summarizeBy": "none"},
+          {"name": "Date", "dataType": "dateTime", "isHidden": true, "sourceColumn": "date", "formatString": "yyyy-MM-dd", "summarizeBy": "none"}
+        ],
+        "partitions": [{"name": "Commits", "mode": "directLake", "source": {"type": "entity", "entityName": "fact_commits", "expressionSource": "DirectLake - GitHub Analytics", "schemaName": "gold"}}],
+        "measures": [
+          {"name": "Total Commits", "description": "Current default-branch commits in the selected author-date cohort.", "expression": "COALESCE(COUNTROWS('Commits'), 0)", "formatString": "#,##0", "displayFolder": "Activity"},
+          {"name": "Commit Authors", "description": "Distinct identified GitHub accounts authoring commits in the selection; unlinked accounts are excluded.", "expression": "COALESCE(CALCULATE(DISTINCTCOUNT('Commits'[Author Login]), KEEPFILTERS('Commits'[Author Login] <> \"unlinked\")), 0)", "formatString": "#,##0", "displayFolder": "Activity"}
+        ]
+      },
+      {
+        "name": "Issues",
+        "description": "One row per non-pull-request issue in the current GitHub snapshot. Date filters select creation cohorts; state is current, not historical backlog.",
+        "columns": [
+          {"name": "Repository Id", "dataType": "int64", "isHidden": true, "sourceColumn": "repository_id", "summarizeBy": "none"},
+          {"name": "Author Login", "dataType": "string", "isHidden": true, "sourceColumn": "actor_login", "summarizeBy": "none"},
+          {"name": "Date", "dataType": "dateTime", "isHidden": true, "sourceColumn": "date", "formatString": "yyyy-MM-dd", "summarizeBy": "none"},
+          {"name": "Issue Number", "dataType": "int64", "description": "Issue number within its repository; never aggregate this identifier.", "sourceColumn": "number", "summarizeBy": "none"},
+          {"name": "Title", "dataType": "string", "description": "Current issue title.", "sourceColumn": "title", "summarizeBy": "none"},
+          {"name": "State", "dataType": "string", "description": "Current issue state, open or closed.", "sourceColumn": "state", "summarizeBy": "none"},
+          {"name": "Hours to Close", "dataType": "decimal", "isHidden": true, "sourceColumn": "hours_to_close", "summarizeBy": "none"}
+        ],
+        "partitions": [{"name": "Issues", "mode": "directLake", "source": {"type": "entity", "entityName": "fact_issues", "expressionSource": "DirectLake - GitHub Analytics", "schemaName": "gold"}}],
+        "measures": [
+          {"name": "Total Issues", "description": "Non-pull-request issues created in the selected date cohort, regardless of current state.", "expression": "COALESCE(COUNTROWS('Issues'), 0)", "formatString": "#,##0", "displayFolder": "Current State"},
+          {"name": "Open Issues", "description": "Currently open issues among the selected creation-date cohort; not historical backlog.", "expression": "COALESCE(CALCULATE(COUNTROWS('Issues'), KEEPFILTERS('Issues'[State] = \"open\")), 0)", "formatString": "#,##0", "displayFolder": "Current State"},
+          {"name": "Closed Issues", "description": "Currently closed issues among the selected creation-date cohort.", "expression": "COALESCE(CALCULATE(COUNTROWS('Issues'), KEEPFILTERS('Issues'[State] = \"closed\")), 0)", "formatString": "#,##0", "displayFolder": "Current State"},
+          {"name": "Average Hours to Close", "description": "Average elapsed hours from creation to closure for closed issues in the selected creation cohort. Blank if none are closed.", "expression": "AVERAGE('Issues'[Hours to Close])", "formatString": "#,##0.0", "displayFolder": "Cycle Time"}
+        ]
+      },
+      {
+        "name": "Pull Requests",
+        "description": "One row per pull request in the current GitHub snapshot. Date filters apply to creation, including for merged metrics.",
+        "columns": [
+          {"name": "Repository Id", "dataType": "int64", "isHidden": true, "sourceColumn": "repository_id", "summarizeBy": "none"},
+          {"name": "Author Login", "dataType": "string", "isHidden": true, "sourceColumn": "actor_login", "summarizeBy": "none"},
+          {"name": "Date", "dataType": "dateTime", "isHidden": true, "sourceColumn": "date", "formatString": "yyyy-MM-dd", "summarizeBy": "none"},
+          {"name": "Pull Request Number", "dataType": "int64", "description": "Pull-request number within its repository; never aggregate this identifier.", "sourceColumn": "number", "summarizeBy": "none"},
+          {"name": "Title", "dataType": "string", "description": "Current pull-request title.", "sourceColumn": "title", "summarizeBy": "none"},
+          {"name": "State", "dataType": "string", "description": "Current open or closed state; merged pull requests are closed.", "sourceColumn": "state", "summarizeBy": "none"},
+          {"name": "Is Draft", "dataType": "boolean", "description": "Whether the pull request is currently a draft.", "sourceColumn": "draft", "summarizeBy": "none"},
+          {"name": "Is Merged", "dataType": "boolean", "description": "Whether GitHub reports a non-null merge timestamp.", "sourceColumn": "is_merged", "summarizeBy": "none"},
+          {"name": "Hours to Merge", "dataType": "decimal", "isHidden": true, "sourceColumn": "hours_to_merge", "summarizeBy": "none"}
+        ],
+        "partitions": [{"name": "Pull Requests", "mode": "directLake", "source": {"type": "entity", "entityName": "fact_pull_requests", "expressionSource": "DirectLake - GitHub Analytics", "schemaName": "gold"}}],
+        "measures": [
+          {"name": "Total Pull Requests", "description": "All pull requests created in the selected date cohort, including drafts and open items.", "expression": "COALESCE(COUNTROWS('Pull Requests'), 0)", "formatString": "#,##0", "displayFolder": "Current State"},
+          {"name": "Open Pull Requests", "description": "Currently open pull requests among the selected creation-date cohort.", "expression": "COALESCE(CALCULATE(COUNTROWS('Pull Requests'), KEEPFILTERS('Pull Requests'[State] = \"open\")), 0)", "formatString": "#,##0", "displayFolder": "Current State"},
+          {"name": "Merged Pull Requests", "description": "Merged pull requests among the selected creation-date cohort. Dates are creation dates, not merge dates.", "expression": "COALESCE(CALCULATE(COUNTROWS('Pull Requests'), KEEPFILTERS('Pull Requests'[Is Merged] = TRUE())), 0)", "formatString": "#,##0", "displayFolder": "Outcomes"},
+          {"name": "Merge Rate", "description": "Merged divided by all pull requests in the selected creation cohort, including still-open items in the denominator. Blank if no pull requests exist.", "expression": "DIVIDE([Merged Pull Requests], [Total Pull Requests])", "formatString": "0.0%", "displayFolder": "Outcomes"},
+          {"name": "Average Hours to Merge", "description": "Average elapsed hours from creation to merge among merged pull requests in the selected creation cohort. Blank if no merged items exist.", "expression": "AVERAGE('Pull Requests'[Hours to Merge])", "formatString": "#,##0.0", "displayFolder": "Cycle Time"}
+        ]
+      },
+      {
+        "name": "Repository Daily",
+        "description": "Last observed repository counters per UTC day. Stars and forks are semi-additive snapshots, not events; history starts with the first capture.",
+        "columns": [
+          {"name": "Repository Id", "dataType": "int64", "isHidden": true, "sourceColumn": "repository_id", "summarizeBy": "none"},
+          {"name": "Date", "dataType": "dateTime", "isHidden": true, "sourceColumn": "date", "formatString": "yyyy-MM-dd", "summarizeBy": "none"},
+          {"name": "Captured At", "dataType": "dateTime", "isHidden": true, "sourceColumn": "ingested_at", "formatString": "yyyy-MM-dd HH:mm:ss", "summarizeBy": "none"},
+          {"name": "Star Count", "dataType": "int64", "isHidden": true, "sourceColumn": "stars", "summarizeBy": "none"},
+          {"name": "Fork Count", "dataType": "int64", "isHidden": true, "sourceColumn": "forks", "summarizeBy": "none"}
+        ],
+        "partitions": [{"name": "Repository Daily", "mode": "directLake", "source": {"type": "entity", "entityName": "fact_repository_daily", "expressionSource": "DirectLake - GitHub Analytics", "schemaName": "gold"}}],
+        "measures": [
+          {"name": "Latest Stars", "description": "Stars at the last observed date per repository within the selected dates. Never adds snapshots across time; blank before the first capture.", "expression": "SUMX(VALUES('Repository'[Repository Id]), VAR _latest = CALCULATE(MAX('Repository Daily'[Date])) RETURN CALCULATE(MAX('Repository Daily'[Star Count]), KEEPFILTERS('Repository Daily'[Date] = _latest)))", "formatString": "#,##0", "displayFolder": "Latest Observation"},
+          {"name": "Latest Forks", "description": "Forks at the last observed date per repository within the selected dates. Never adds snapshots across time; blank before the first capture.", "expression": "SUMX(VALUES('Repository'[Repository Id]), VAR _latest = CALCULATE(MAX('Repository Daily'[Date])) RETURN CALCULATE(MAX('Repository Daily'[Fork Count]), KEEPFILTERS('Repository Daily'[Date] = _latest)))", "formatString": "#,##0", "displayFolder": "Latest Observation"},
+          {"name": "Last Captured At", "description": "Most recent successful GitHub capture timestamp in the selected repository/date context, in UTC.", "expression": "MAX('Repository Daily'[Captured At])", "formatString": "yyyy-MM-dd HH:mm:ss \"UTC\"", "displayFolder": "Freshness"}
+        ]
+      }
+    ],
+    "relationships": [
+      {"name": "Commits to Repository", "fromTable": "Commits", "fromColumn": "Repository Id", "toTable": "Repository", "toColumn": "Repository Id"},
+      {"name": "Commits to Date", "fromTable": "Commits", "fromColumn": "Date", "toTable": "Date", "toColumn": "Date"},
+      {"name": "Commits to Author", "fromTable": "Commits", "fromColumn": "Author Login", "toTable": "Author", "toColumn": "GitHub Login"},
+      {"name": "Issues to Repository", "fromTable": "Issues", "fromColumn": "Repository Id", "toTable": "Repository", "toColumn": "Repository Id"},
+      {"name": "Issues to Date", "fromTable": "Issues", "fromColumn": "Date", "toTable": "Date", "toColumn": "Date"},
+      {"name": "Issues to Author", "fromTable": "Issues", "fromColumn": "Author Login", "toTable": "Author", "toColumn": "GitHub Login"},
+      {"name": "Pull Requests to Repository", "fromTable": "Pull Requests", "fromColumn": "Repository Id", "toTable": "Repository", "toColumn": "Repository Id"},
+      {"name": "Pull Requests to Date", "fromTable": "Pull Requests", "fromColumn": "Date", "toTable": "Date", "toColumn": "Date"},
+      {"name": "Pull Requests to Author", "fromTable": "Pull Requests", "fromColumn": "Author Login", "toTable": "Author", "toColumn": "GitHub Login"},
+      {"name": "Repository Daily to Repository", "fromTable": "Repository Daily", "fromColumn": "Repository Id", "toTable": "Repository", "toColumn": "Repository Id"},
+      {"name": "Repository Daily to Date", "fromTable": "Repository Daily", "fromColumn": "Date", "toTable": "Date", "toColumn": "Date"}
+    ],
+    "expressions": [
+      {
+        "name": "DirectLake - GitHub Analytics",
+        "description": "Shared OneLake connection to the schema-enabled GitHub analytics lakehouse; Gold entity partitions only.",
+        "kind": "m",
+        "expression": [
+          "let",
+          "    Source = AzureStorage.DataLake(\"https://onelake.dfs.fabric.microsoft.com/${WORKSPACE_ID}/${LAKEHOUSE_ID}\", [HierarchicalNavigation=true])",
+          "in",
+          "    Source"
+        ]
+      }
+    ]
+  }
+}

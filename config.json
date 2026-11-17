@@ -1,0 +1,6 @@
+{
+  "repository": "roberts-andy/github-fabric-analytics",
+  "workspace": "github-fabric-analytics-dev",
+  "lakehouse": "github_analytics",
+  "semantic_model": "GitHub Analytics"
+}
