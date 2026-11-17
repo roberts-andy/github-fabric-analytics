@@ -5,8 +5,8 @@
   "semantic_model": "GitHub Analytics",
   "github_ingestion": {
     "load_mode": "incremental",
-    "auth_mode": "anonymous",
-    "key_vault_url": "",
-    "secret_name": ""
+    "auth_mode": "key_vault",
+    "key_vault_url": "https://andyfabcentral-gh-kv.vault.azure.net/",
+    "secret_name": "github-token"
   }
 }

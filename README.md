@@ -151,32 +151,56 @@ with an active pipeline.
 
 ### GitHub authentication
 
-The public-only prototype defaults to explicit `anonymous` mode. This requires
-no token, but GitHub typically allows only **60 requests/hour per outbound IP**;
+Activity ingestion is configured for `key_vault` authentication. Explicit
+`anonymous` mode requires no token, but GitHub typically allows only
+**60 requests/hour per outbound IP**;
 Fabric egress can be shared. Growing inventories or repeated runs can exceed that
 limit. Errors fail visibly and retain the previous completed landing batch.
 The extractor reuses one owner listing for metadata to reduce API requests and
 never silently switches from authenticated to anonymous access.
 
-For reliable recurring operation, store a read-only GitHub token in an existing
-Azure Key Vault, and set only these non-secret references in `config.json`:
+Store a read-only GitHub token in Azure Key Vault, and set only non-secret
+references in `config.json`. The current deployment references:
 
 ```json
 "github_ingestion": {
   "load_mode": "incremental",
   "auth_mode": "key_vault",
-  "key_vault_url": "https://<vault-name>.vault.azure.net/",
-  "secret_name": "<github-token-secret-name>"
+  "key_vault_url": "https://andyfabcentral-gh-kv.vault.azure.net/",
+  "secret_name": "github-token"
 }
 ```
 
-Give the Fabric run identity secret-read access through your normal approval
-process. Redeploy `00_ingest_github` with
+The Standard vault `andyfabcentral-gh-kv` is in `fabric-rg`, Central US, alongside
+the `andyfabcentral` capacity. It uses Azure RBAC, soft delete and purge protection.
+The deployment user has a vault-scoped Key Vault Secrets Officer role for
+creating/updating the token and running the notebook.
+
+Public network access was enabled by the vault owner, and `github-token` is
+provisioned. Set its latest enabled version to your real GitHub token. The
+notebook rejects the initial `REPLACE_WITH_GITHUB_TOKEN` placeholder explicitly
+before making GitHub requests.
+
+Create a fine-grained personal access token in
+[GitHub account settings](https://github.com/settings/personal-access-tokens/new?name=Fabric+GitHub+Analytics&target_name=roberts-andy&expires_in=90).
+Choose **Public repositories** and a finite expiration; this public-only
+ingestion needs no additional permissions. Fine-grained tokens already include
+read-only access to public repositories. No write or private-repository access
+is needed.
+
+In Azure Portal, open the vault's **Secrets** page, select `github-token`, and
+create a **New Version** containing your token. Never paste the token into chat
+or source.
+
+Give any different Fabric run identity secret-read access through your normal
+approval process. Redeploy `00_ingest_github` after changing references with
 `python scripts\project.py deploy --notebook 00_ingest_github`.
 It retrieves the token with `notebookutils.credentials.getSecret` at runtime.
+The reference is unversioned, so replacing the secret with a new enabled version
+does not require another notebook deployment.
 Never put the token in configuration, notebook parameters, output, or source.
-No token is copied from the local GitHub CLI, and no vault, secret, or access grant
-is provisioned by this project. Discovery remains a low-volume anonymous public
+No token is copied from the local GitHub CLI. The scripts do not automatically
+provision vaults, secrets, or access grants. Discovery remains a low-volume anonymous public
 inventory scan, even when activity ingestion uses a Key Vault token.
 
 ### Rescan repositories from Fabric

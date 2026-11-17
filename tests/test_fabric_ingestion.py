@@ -232,6 +232,24 @@ class IngestionTests(unittest.TestCase):
                 "key_vault", "https://example.vault.azure.net", "github", utility
             )
 
+    def test_key_vault_token_rejects_placeholder_and_reads_latest_secret(self):
+        utility = Mock()
+        utility.credentials.getSecret.return_value = " REPLACE_WITH_GITHUB_TOKEN\n"
+        with self.assertRaisesRegex(ValueError, "placeholder"):
+            INGEST["github_token"](
+                "key_vault", "https://example.vault.azure.net/", "github-token", utility
+            )
+        utility.credentials.getSecret.return_value = " test-token\n"
+        self.assertEqual(
+            INGEST["github_token"](
+                "key_vault", "https://example.vault.azure.net/", "github-token", utility
+            ),
+            "test-token",
+        )
+        utility.credentials.getSecret.assert_called_with(
+            "https://example.vault.azure.net/", "github-token"
+        )
+
     def test_pipeline_chains_all_stages_and_refuses_implicit_retries(self):
         state = {
             "workspace_id": "workspace",

@@ -111,6 +111,11 @@ def github_token(mode, vault_url, secret_name, utilities):
     token = utilities.credentials.getSecret(vault_url, secret_name)
     if not isinstance(token, str) or not token.strip():
         raise ValueError("The configured GitHub secret is empty")
+    if token.strip() == "REPLACE_WITH_GITHUB_TOKEN":
+        raise ValueError(
+            "Replace the github-token placeholder in Azure Key Vault with your "
+            "GitHub token before running ingestion"
+        )
     return token.strip()
 
 
