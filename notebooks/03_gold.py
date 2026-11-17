@@ -1,3 +1,20 @@
+# %% [markdown]
+# ## Gold: build the reporting star schema
+#
+# **Inputs:** the complete current Silver state and its completion marker, plus
+# Bronze repository observations for stars/forks.
+# **Outputs:** three dimensions, four fact tables and
+# `Files/github/validation_gold.json` for the semantic-model refresh gate.
+#
+# Gold deliberately rebuilds these small tables in full even when extraction and
+# Silver are incremental. Reading complete Silver state preserves historical
+# activity and keeps the model's dimensions and facts consistent.
+#
+# ## Confirm Silver completed before shaping the model
+#
+# Check the completion marker and recorded row counts, not every row's batch ID:
+# an unchanged Silver row correctly retains an older source batch.
+# %%
 import json
 
 import notebookutils
@@ -23,6 +40,17 @@ for entity in ("repositories", "commits", "issues", "pull_requests"):
 if sources["repositories"].count() != latest["repository_count"]:
     raise ValueError("Gold source does not cover the complete repository inventory")
 
+# %% [markdown]
+# ## Build dimensions and activity facts
+#
+# Repository and actor dimensions provide shared filter paths. The date dimension
+# is continuous from the earliest observed creation date to at least one year
+# beyond today, so empty days can appear in trends.
+#
+# Activity facts use commit author date and issue/PR creation date in UTC.
+# Close/merge durations describe creation cohorts, not merge-date throughput or
+# DORA lead time. Those distinctions matter when interpreting the report.
+# %%
 repository = sources["repositories"]
 tables = {
     "dim_repository": repository.select(
@@ -33,6 +61,7 @@ tables = {
 actors = sources["commits"].select("actor_login")
 for entity in ("issues", "pull_requests"):
     actors = actors.union(sources[entity].select("actor_login"))
+# Always provide the fallback dimension member used by unlinked source activity.
 tables["dim_actor"] = actors.union(
     spark.createDataFrame([("unlinked",)], "actor_login STRING")
 ).distinct()
@@ -83,8 +112,13 @@ for entity in ("issues", "pull_requests"):
         ]
     tables[f"fact_{entity}"] = source.select(*columns)
 
-# Stars/forks are observations, not historical GitHub events. Retain one capture
-# per repository per UTC day and never add snapshot values across dates.
+# %% [markdown]
+# ## Retain daily observations of repository popularity
+#
+# Stars and forks are snapshots, not historical event counts. Read prior Bronze
+# captures and keep the latest observation per repository per UTC day. Twice-daily
+# refreshes therefore produce one daily row; do not sum snapshot values over dates.
+# %%
 snapshots = (
     spark.table("bronze.github_raw").where("entity = 'repositories'")
     .withColumn("data", F.from_json(
@@ -106,6 +140,13 @@ tables["fact_repository_daily"] = (
     .where("_row = 1").drop("_row", "batch_id")
 )
 
+# %% [markdown]
+# ## Validate the star schema before publishing
+#
+# Enforce each table's natural-key grain, non-null keys and fact-to-dimension
+# referential integrity. Reconcile activity counts back to Silver so a join or
+# projection cannot silently drop history.
+# %%
 keys = {
     "dim_repository": ["repository_id"], "dim_actor": ["actor_login"],
     "dim_date": ["date"], "fact_commits": ["repository_id", "commit_sha"],
@@ -134,8 +175,14 @@ for entity in ("commits", "issues", "pull_requests"):
     if metrics[f"fact_{entity}"] != sources[entity].count():
         raise ValueError(f"Silver-to-Gold reconciliation failed for {entity}")
 
-# Small dimensions and full source snapshots are deliberately unpartitioned;
-# incremental partition rewrites would add overhead without saving work here.
+# %% [markdown]
+# ## Write the reporting tables and validation artifact
+#
+# These small tables are unpartitioned to avoid needless partition-management
+# overhead. Delta writes are atomic per table, not across the whole star schema.
+# Publish validation only after all persisted counts agree; the next notebook
+# refuses to refresh the semantic model without a validation artifact for this batch.
+# %%
 for name, frame in tables.items():
     frame.write.format("delta").mode("overwrite").option(
         "overwriteSchema", "true"

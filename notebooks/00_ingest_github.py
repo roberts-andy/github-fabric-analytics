@@ -1,3 +1,25 @@
+# %% [markdown]
+# ## Land GitHub activity from the Fabric notebook
+#
+# **Inputs:** the discovery inventory, notebook authentication/load parameters,
+# and `Files/github/checkpoint.json` from the last fully successful refresh.
+# The GitHub token is retrieved from Azure Key Vault at runtime, never embedded
+# in notebook parameters or written to the lakehouse.
+#
+# **Outputs:** a unique batch directory containing raw JSON Lines and a manifest,
+# then `Files/github/latest.json` pointing to the completed extraction.
+# Each record retains repository ID, entity, source URL, batch ID and capture time.
+#
+# HTTP runs on the driver, not once per Spark row: this gives pagination, retries,
+# rate limits and batch publication one controlled execution path.
+#
+# ## HTTP and credential helpers
+#
+# All GitHub requests, next-page links and redirects must remain on
+# `https://api.github.com` so authenticated requests cannot follow an external
+# link. Only bounded transient GET failures are retried; authentication and
+# permission failures never trigger a silent switch to anonymous access.
+# %%
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -10,6 +32,7 @@ import uuid
 
 
 def github_url(url):
+    """Validate a GitHub API URL before requesting it or following a link."""
     parsed = urllib.parse.urlsplit(url)
     if (parsed.scheme != "https" or parsed.netloc != "api.github.com"
             or parsed.fragment or parsed.username or parsed.password):
@@ -18,18 +41,25 @@ def github_url(url):
 
 
 class GitHubRedirect(urllib.request.HTTPRedirectHandler):
+    """Apply the same host restriction to redirects as to ordinary requests."""
+
     def redirect_request(self, request, response, code, message, headers, url):
+        """Reject a redirect target before urllib forwards the request."""
         github_url(url)
         return super().redirect_request(request, response, code, message, headers, url)
 
 
 class GitHubAPIError(RuntimeError):
+    """Expose HTTP status so commit reconciliation can distinguish a missing base."""
+
     def __init__(self, status, message):
+        """Retain status separately from the safe, credential-free error text."""
         super().__init__(message)
         self.status = status
 
 
 def next_page(link):
+    """Extract one validated next-page URL, rejecting ambiguous pagination."""
     links = re.findall(r'<([^>]+)>;\s*rel="next"', link)
     if len(links) > 1:
         raise ValueError("Ambiguous GitHub next-page link")
@@ -37,7 +67,10 @@ def next_page(link):
 
 
 class GitHubAPI:
+    """Driver-side JSON client with guarded pagination and bounded GET retries."""
+
     def __init__(self, token=None):
+        """Keep an optional runtime token in request headers, not in batch data."""
         self.headers = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
@@ -49,6 +82,7 @@ class GitHubAPI:
         self.requests = 0
 
     def page(self, url, allow_empty_repository=False):
+        """Read one JSON response and its Link header or raise an explicit failure."""
         github_url(url)
         for attempt in range(3):
             request = urllib.request.Request(url, headers=self.headers)
@@ -60,6 +94,7 @@ class GitHubAPI:
                 with error:
                     raw = error.read().decode("utf-8", errors="replace")
                 if error.code == 409 and allow_empty_repository:
+                    # A zero-size repository can still have commits; only this API error proves emptiness.
                     body = json.loads(raw)
                     if body.get("message") == "Git Repository is empty.":
                         print(f"{url}: empty repository (0 commits)", flush=True)
@@ -83,6 +118,7 @@ class GitHubAPI:
         raise RuntimeError("GitHub GET retry limit reached")
 
     def pages(self, url, allow_empty_repository=False):
+        """Yield every object from list pages while detecting cycles and bad shapes."""
         seen = set()
         while url:
             github_url(url)
@@ -97,6 +133,7 @@ class GitHubAPI:
 
 
 def github_token(mode, vault_url, secret_name, utilities):
+    """Resolve the selected credential mode without logging or persisting the token."""
     if mode == "anonymous":
         if vault_url or secret_name:
             raise ValueError("Select key_vault authentication to use a configured secret")
@@ -108,6 +145,7 @@ def github_token(mode, vault_url, secret_name, utilities):
         raise ValueError("Specify a valid Azure Key Vault HTTPS URL")
     if not re.fullmatch(r"[a-zA-Z0-9-]+", secret_name):
         raise ValueError("Specify a valid GitHub token secret name")
+    # An unversioned reference picks up token rotation without redeploying this notebook.
     token = utilities.credentials.getSecret(vault_url, secret_name)
     if not isinstance(token, str) or not token.strip():
         raise ValueError("The configured GitHub secret is empty")
@@ -119,7 +157,21 @@ def github_token(mode, vault_url, secret_name, utilities):
     return token.strip()
 
 
+# %% [markdown]
+# ## Decide which changes to extract
+#
+# Commits use saved default-branch head SHAs, not author-date filters: a newly
+# pushed commit can have an old author date. Fast-forward comparisons fetch only
+# new commits; a changed default branch or unavailable/rewritten history requires
+# a complete commit reconciliation for that repository.
+#
+# Issues use the last successful watermark minus five minutes. The overlap
+# reduces boundary/timing gaps, and Silver upserts make repeated records safe.
+# Checkpoints are proposed here but committed only after Gold and the semantic
+# model refresh succeed, so a failed chain does not skip changes on the next run.
+# %%
 def changed_commits(client, base, branch, previous, full):
+    """Return commit objects, source URL, load mode and the captured branch head."""
     head_page, _ = client.page(
         base + "/commits?" + urllib.parse.urlencode({"sha": branch, "per_page": 1}),
         allow_empty_repository=True,
@@ -163,14 +215,17 @@ def changed_commits(client, base, branch, previous, full):
             commits.extend(page["commits"])
             url = next_page(link)
         else:
+            # Only a fully exhausted, fast-forward comparison is safe to treat as incremental.
             if len(commits) != expected or not any(c["sha"] == head for c in commits):
                 raise ValueError("Incomplete paginated commit comparison")
             return commits, compare_url, "incremental", head
+    # Anchor a full read to the captured SHA so a moving branch name cannot change its target.
     objects = client.pages(full_url, allow_empty_repository=True) if head else []
     return objects, full_url, "full", head
 
 
 def incremental_since(previous, captured):
+    """Return a UTC overlap boundary based on the last successful capture start."""
     watermark = datetime.fromisoformat(previous["watermark"])
     now = datetime.fromisoformat(captured)
     if watermark.tzinfo is None or watermark > now:
@@ -178,7 +233,22 @@ def incremental_since(previous, captured):
     return (watermark.astimezone(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# %% [markdown]
+# ## Extract and publish one complete batch
+#
+# Recheck inventory eligibility before extracting. New repositories bootstrap
+# fully; existing repositories use their own checkpoint and per-entity load mode.
+# GitHub's issues feed includes PR markers, allowing us to fetch details only for
+# PRs that changed instead of rereading the entire PR collection.
+#
+# The unique output directory prevents overwriting earlier captures. Publish the
+# immutable manifest after closing the records file, and update `latest.json`
+# last. A failed extraction therefore leaves the previous published batch intact.
+# This change feed does not include deletion tombstones; use explicit `full` mode
+# for periodic deletion reconciliation.
+# %%
 def ingest(inventory, owner, client, utilities, files, checkpoint=None, load_mode="incremental"):
+    """Validate scope, land source records and publish a complete batch manifest."""
     if load_mode not in ("incremental", "full"):
         raise ValueError("load_mode must be incremental or full")
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9-]{0,38}", owner):
@@ -211,6 +281,7 @@ def ingest(inventory, owner, client, utilities, files, checkpoint=None, load_mod
     if not files.is_dir():
         raise ValueError("The default lakehouse Files mount is missing")
     batch = uuid.uuid4().hex
+    # Use capture start, not finish, so changes arriving during extraction are replayed next time.
     captured = datetime.now(timezone.utc).isoformat()
     if checkpoint is not None and checkpoint["owner"].lower() != owner.lower():
         raise ValueError("Checkpoint belongs to another GitHub owner")
@@ -260,6 +331,7 @@ def ingest(inventory, owner, client, utilities, files, checkpoint=None, load_mod
                 elif entity == "commits":
                     objects = commits
                 elif entity == "pull_requests" and not full:
+                    # The issues loop runs first and has already collected changed PR numbers.
                     objects = (client.page(f"{base}/pulls/{number}")[0]
                                for number in sorted(changed_pulls))
                 else:
@@ -268,6 +340,7 @@ def ingest(inventory, owner, client, utilities, files, checkpoint=None, load_mod
                 for item in objects:
                     source_url = url
                     if entity == "issues" and item.get("pull_request") is not None:
+                        # Keep the raw marker in Bronze; Silver separates true issues from PRs.
                         changed_pulls.add(int(item["number"]))
                     if entity == "pull_requests" and not full:
                         source_url = f"{base}/pulls/{item['number']}"
@@ -294,6 +367,7 @@ def ingest(inventory, owner, client, utilities, files, checkpoint=None, load_mod
             }
             print(f"{full_name}: {json.dumps(per_repository)}", flush=True)
 
+    # Store load modes alongside counts so Silver can distinguish deltas from replacement snapshots.
     manifest = {
         "batch_id": batch, "ingested_at": captured, "owner": owner,
         "discovery_run_id": inventory["discovery_run_id"],
@@ -312,7 +386,16 @@ def ingest(inventory, owner, client, utilities, files, checkpoint=None, load_mod
     return manifest
 
 
+# %% [markdown]
+# ## Run using the Fabric context
+#
+# Resolve credentials and the last committed checkpoint through NotebookUtils,
+# then land files in the attached lakehouse's driver mount. This entry point
+# is used by the refresh pipeline; helper functions remain independently testable.
+# The next notebook, `01_bronze`, consumes only the published batch.
+# %%
 def main(owner, mode, vault_url, secret_name, load_mode):
+    """Connect Fabric credentials and files to the extraction helpers."""
     import notebookutils
 
     token = github_token(mode, vault_url, secret_name, notebookutils)

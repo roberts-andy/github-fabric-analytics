@@ -72,6 +72,12 @@ and notebook packages are stored locally under ignored `.local`. `bootstrap` cre
 the medallion schemas through Livy and releases the session. `deploy` validates
 Jupyter structure and binds all notebooks to the lakehouse before uploading.
 
+Notebook sources in `notebooks` use `# %% [markdown]` for narrative cells and
+`# %%` for code cells. Markdown is stored as Python comments so the same files
+remain valid Python for local helper tests. Deployment preserves this cell
+ordering after the generated title and parameter cells. Edit these sources,
+then redeploy to keep the explanations and live Fabric notebooks in sync.
+
 ### Refresh entirely in Fabric
 
 Open the **GitHub Analytics Refresh** pipeline in the workspace and select **Run**.

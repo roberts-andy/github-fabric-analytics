@@ -1,3 +1,23 @@
+# %% [markdown]
+# ## Discover the repository inventory
+#
+# **Position in the refresh:** discovery -> API landing -> Bronze -> Silver ->
+# Gold -> semantic-model refresh.
+#
+# This notebook defines the scope of the whole run: public repositories currently
+# owned by the `owner` parameter, excluding forks and including archived projects.
+# It does not retrieve activity history or access private repositories.
+#
+# **Outputs:** `bronze.repository_registry`, an immutable inventory file for this
+# discovery run, and `Files/github/repository_inventory.json` for the next notebook.
+# The attached schema-enabled lakehouse must already contain the Bronze schema.
+#
+# ## Read every public repository page before changing the registry
+#
+# Discovery deliberately uses anonymous public access. A partial response, API
+# error, duplicate ID, or empty eligible inventory stops the run instead of
+# publishing an inventory that could incorrectly remove repositories downstream.
+# %%
 import json
 import re
 import urllib.error
@@ -17,6 +37,7 @@ url = (
     f"https://api.github.com/users/{urllib.parse.quote(owner)}/repos"
     "?type=owner&per_page=100&sort=full_name"
 )
+# Repository IDs remain stable across renames; display names are descriptive attributes.
 repositories = []
 seen_pages = set()
 while url:
@@ -47,6 +68,13 @@ while url:
         raise ValueError("Ambiguous GitHub next-page link")
     url = next_links[0] if next_links else None
 
+# %% [markdown]
+# ## Apply eligibility and maintain the registry
+#
+# A complete owner scan lets us mark missing/ineligible repositories inactive.
+# Preserve `first_seen_at` for existing IDs so recurring discovery does not erase
+# the date we first observed a repository. Other owners' registry rows are untouched.
+# %%
 eligible = [
     repository for repository in repositories
     if repository["private"] is False
@@ -76,6 +104,7 @@ current = (
     .withColumn("is_active", F.lit(True))
     .cache()
 )
+# Materialize the cached frame once so the merge shares one set of observation times.
 current.count()
 if not spark.catalog.tableExists("bronze.repository_registry"):
     current.write.format("delta").saveAsTable("bronze.repository_registry")
@@ -94,6 +123,13 @@ else:
         )
         .execute()
     )
+# %% [markdown]
+# ## Check coverage and publish the inventory
+#
+# The active registry count must agree with the completed GitHub scan. The
+# run-specific file records what was discovered; the shared inventory pointer
+# tells `00_ingest_github` which repositories to fetch on this refresh.
+# %%
 active = spark.table("bronze.repository_registry").where(
     F.col("is_active") & (F.lower("owner_login") == owner.lower())
 )

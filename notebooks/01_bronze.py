@@ -1,3 +1,20 @@
+# %% [markdown]
+# ## Bronze: preserve the captured source and its provenance
+#
+# **Input:** the batch selected by `Files/github/latest.json`, including its
+# immutable manifest and `records.jsonl` file.
+# **Outputs:** append-only `bronze.github_raw` and `bronze.ingestion_batches`.
+#
+# Bronze keeps GitHub payloads as JSON strings rather than imposing business
+# schemas. This preserves the source for replay and allows Silver rules to evolve.
+# A repeated batch is insert-only and idempotent on its repository-scoped keys.
+#
+# ## Validate the landing contract before writing
+#
+# Check the pointer against the immutable manifest, then reconcile total,
+# per-entity and per-repository counts. An incremental run can legitimately have
+# zero activity rows, but must still contain metadata for every declared repository.
+# %%
 import json
 import re
 
@@ -6,6 +23,7 @@ from delta.tables import DeltaTable
 from pyspark.sql import functions as F
 
 spark.conf.set("spark.sql.session.timeZone", "UTC")
+# Bronze is optimized for landing and replay; downstream layers enable V-Order for reads.
 spark.conf.set("spark.sql.parquet.vorder.default", "false")
 spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
 
@@ -18,6 +36,7 @@ manifest = json.loads(notebookutils.fs.head(f"{path}/manifest.json", 16384))
 if manifest != latest:
     raise ValueError("Latest batch pointer does not match the immutable batch manifest")
 
+# An explicit envelope schema avoids type inference changing IDs or timestamps between batches.
 raw = (
     spark.read.schema(
         "repository_id LONG, entity STRING, record_id STRING, payload STRING, source_url STRING, "
@@ -76,6 +95,13 @@ if raw.count() != raw.select(
 ).distinct().count():
     raise ValueError("Duplicate natural keys within a source batch")
 
+# %% [markdown]
+# ## Persist raw records without rewriting earlier batches
+#
+# The merge key includes batch, repository, entity and record ID. It prevents a
+# retry from duplicating a capture while retaining the same source item observed
+# in a later batch. Repository scope also keeps shared commit SHAs distinct.
+# %%
 if not spark.catalog.tableExists("bronze.github_raw"):
     raw.write.format("delta").partitionBy("ingestion_date").saveAsTable("bronze.github_raw")
 else:
@@ -95,6 +121,13 @@ else:
         .whenNotMatchedInsertAll()
         .execute()
     )
+# %% [markdown]
+# ## Record the batch and check the persisted result
+#
+# Register the manifest metadata only after the raw merge succeeds. Silver uses
+# this batch record together with the raw-row count as its readiness gate; the
+# batch table alone is not a transaction covering all downstream layers.
+# %%
 batch = (
     spark.createDataFrame(
         [(batch_id, None, manifest["ingested_at"], manifest["record_count"],

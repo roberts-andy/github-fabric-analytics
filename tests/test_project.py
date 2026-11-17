@@ -69,6 +69,48 @@ class ProjectTests(unittest.TestCase):
             self.assertTrue(result["schemas_created"])
             self.assertEqual(result["latest_batch"]["batch_id"], "batch")
 
+    def test_notebook_export_preserves_markdown_and_shared_code_state(self):
+        import nbformat
+        source_text = (
+            "# %% [markdown]\n"
+            "# ## Prepare the input\n"
+            "#\n"
+            "# Keep the captured value available to later cells.\n"
+            "# %%\n"
+            "first = 40\n"
+            "# %% [markdown]\n"
+            "# ## Finish the calculation\n"
+            "# %%\n"
+            "# This code comment must not become markdown.\n"
+            "result = first + 2\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".local").mkdir()
+            source = root / "layer.py"
+            source.write_text(source_text)
+            with patch.object(project, "ROOT", root):
+                project.notebook_definition(source, {
+                    "workspace_id": "workspace", "lakehouse_id": "lakehouse",
+                })
+            notebook = nbformat.read(root / ".local" / "layer.ipynb", as_version=4)
+            self.assertEqual(
+                [cell.cell_type for cell in notebook.cells],
+                ["markdown", "code", "markdown", "code", "markdown", "code"],
+            )
+            self.assertIn("## Prepare the input", notebook.cells[2].source)
+            self.assertIn("\n\nKeep the captured value", notebook.cells[2].source)
+            self.assertIn("# This code comment", notebook.cells[-1].source)
+            namespace = {}
+            for cell in notebook.cells:
+                if cell.cell_type == "code":
+                    exec(cell.source, namespace)
+            self.assertEqual(namespace["result"], 42)
+
+    def test_notebook_markdown_cannot_hide_executable_python(self):
+        with self.assertRaisesRegex(ValueError, "only comment lines"):
+            project.notebook_cells("# %% [markdown]\n# Description\nresult = 1\n")
+
     def test_in_progress_job_is_monitored_not_resubmitted(self):
         state = {
             "workspace_id": "workspace", "lakehouse_id": "lakehouse",

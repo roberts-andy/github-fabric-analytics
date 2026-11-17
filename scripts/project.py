@@ -142,6 +142,40 @@ def bootstrap(_args):
         api.request("DELETE", session_path)
 
 
+def notebook_cells(source):
+    """Convert percent-format source markers into ordered Jupyter cells."""
+    import nbformat
+
+    sections = []
+    kind, lines = "code", []
+    for line in source.splitlines(keepends=True):
+        marker = line.rstrip("\r\n")
+        if marker in ("# %%", "# %% [markdown]"):
+            sections.append((kind, lines))
+            kind = "markdown" if marker.endswith("[markdown]") else "code"
+            lines = []
+        else:
+            lines.append(line)
+    sections.append((kind, lines))
+    cells = []
+    for kind, lines in sections:
+        if kind == "markdown":
+            if any(line.strip() and not line.startswith("#") for line in lines):
+                raise ValueError("Markdown notebook sections must contain only comment lines")
+            lines = [
+                line[2:] if line.startswith("# ") else line[1:] if line.startswith("#") else line
+                for line in lines
+            ]
+        text = "".join(lines)
+        if text.strip():
+            create = (
+                nbformat.v4.new_markdown_cell if kind == "markdown"
+                else nbformat.v4.new_code_cell
+            )
+            cells.append(create(text))
+    return cells
+
+
 def notebook_definition(path, state):
     import nbformat
 
@@ -166,7 +200,7 @@ def notebook_definition(path, state):
                 "\n".join(f"{key} = {json.dumps(value)}" for key, value in parameters.items()),
                 metadata={"tags": ["parameters"]},
             ),
-            nbformat.v4.new_code_cell(source),
+            *notebook_cells(source),
         ],
         metadata={
             "kernelspec": {

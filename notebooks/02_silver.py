@@ -1,3 +1,20 @@
+# %% [markdown]
+# ## Silver: curate the latest known state of each GitHub item
+#
+# **Inputs:** the published landing manifest, its completed Bronze batch, and
+# existing Silver history. **Outputs:** typed repository, commit, issue and PR
+# tables plus `silver.completed_batch` after every entity succeeds.
+#
+# Incremental batches contain only changes, not complete history. Merge them
+# into existing state; never replace the whole table with the current delta.
+# Explicit full loads can reconcile deletions for the affected repository/entity.
+#
+# ## Gate on Bronze and parse the raw JSON
+#
+# Fixed schemas select the fields this model needs while Bronze retains the full
+# payload. Source repository IDs travel with each object because item numbers
+# and commit SHAs must be interpreted within a repository.
+# %%
 import json
 
 import notebookutils
@@ -40,6 +57,7 @@ schemas = {
 
 
 def parse(entity):
+    """Parse one entity's payload and retain repository and batch provenance."""
     return (
         raw.where(F.col("entity") == entity)
         .withColumn("data", F.from_json("payload", schemas[entity]))
@@ -50,6 +68,14 @@ def parse(entity):
     )
 
 
+# %% [markdown]
+# ## Normalize entity-specific fields
+#
+# Separate true issues from PR markers returned by GitHub's issues endpoint.
+# Use `unlinked` for activity without a linked GitHub account rather than losing
+# those records in later dimension joins. Keep bots; this is activity reporting,
+# not an inference about individual developer productivity.
+# %%
 repository = parse("repositories")
 if repository.count() != latest["repository_count"]:
     raise ValueError("Silver source does not cover the repository inventory")
@@ -85,6 +111,18 @@ for entity in ("issues", "pull_requests"):
         columns += ["merged_at", "draft"]
     frames[entity] = parsed.select(*columns, "batch_id", "ingested_at")
 
+# %% [markdown]
+# ## Validate, deduplicate and merge according to the load plan
+#
+# Reject invalid records into `silver.quality_rejects` and fail visibly; do not
+# quietly publish incomplete counts. Deduplicate by repository-scoped natural
+# keys, preferring the newest source update/capture.
+#
+# Incremental merges retain unseen keys and prevent an older overlapping record
+# from replacing newer state. Delete unseen rows only for explicit full
+# reconciliations or repositories removed from the current inventory. A missing
+# Silver table requires a full bootstrap, not an incremental-only seed.
+# %%
 rules = {
     "repositories": "repository_id IS NOT NULL AND full_name IS NOT NULL "
                     "AND stars >= 0 AND forks >= 0 AND created_at IS NOT NULL",
@@ -106,6 +144,7 @@ key_columns = {
     "pull_requests": ["repository_id", "item_id"],
 }
 repository_ids = [r["id"] for r in latest["repositories"]]
+# Older locally staged manifests represent full snapshots and have no per-entity load plan.
 load_plan = latest.get("repository_loads", {
     str(repository_id): dict.fromkeys(schemas, "full") for repository_id in repository_ids
 })
@@ -116,6 +155,7 @@ if any(set(plan) != set(schemas) or set(plan.values()) - {"full", "incremental"}
     raise ValueError("Invalid repository/entity load mode")
 metrics = {}
 for entity, frame in frames.items():
+    # SQL NULL is not a quality pass; turn unknown rule results into explicit rejects.
     condition = F.coalesce(F.expr(rules[entity]), F.lit(False))
     rejected = frame.where(~condition)
     rejected_count = rejected.count()
@@ -156,6 +196,7 @@ for entity, frame in frames.items():
                 | (F.col(f"source.{freshness}") >= F.col(f"target.{freshness}"))
             ))
             .whenNotMatchedInsertAll()
+            # Absence from a delta means unchanged, not deleted.
             .whenNotMatchedBySourceDelete(condition=(
                 ~F.col("target.repository_id").isin(repository_ids)
                 | F.col("target.repository_id").isin(full_ids)
@@ -172,6 +213,14 @@ for entity, frame in frames.items():
     if actual != expected:
         raise ValueError(f"Silver {entity} persisted {actual}; expected {expected}")
     metrics[entity] = {"rows": actual, "rejected": rejected_count}
+# %% [markdown]
+# ## Publish the Silver completion marker
+#
+# Gold must see one marker for this batch and matching persisted table counts.
+# This marker is written last because entity merges are separate Delta
+# transactions. Retained rows keep their own originating batch IDs; they do not
+# all need to be rewritten just to certify that this refresh completed.
+# %%
 spark.createDataFrame(
     [(batch_id, json.dumps(metrics))], "batch_id STRING, table_metrics STRING"
 ).write.format("delta").mode("overwrite").saveAsTable("silver.completed_batch")
