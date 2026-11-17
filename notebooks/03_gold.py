@@ -18,8 +18,6 @@ silver_metrics = json.loads(completion[0]["table_metrics"])
 sources = {}
 for entity in ("repositories", "commits", "issues", "pull_requests"):
     sources[entity] = spark.table(f"silver.{entity}")
-    if sources[entity].where(F.col("batch_id") != batch_id).limit(1).count():
-        raise ValueError(f"Stale Silver batch in {entity}")
     if sources[entity].count() != silver_metrics[entity]["rows"]:
         raise ValueError(f"Incomplete Silver table: {entity}")
 if sources["repositories"].count() != latest["repository_count"]:

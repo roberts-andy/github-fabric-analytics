@@ -2,5 +2,11 @@
   "owner": "roberts-andy",
   "workspace": "github-fabric-analytics-dev",
   "lakehouse": "github_analytics",
-  "semantic_model": "GitHub Analytics"
+  "semantic_model": "GitHub Analytics",
+  "github_ingestion": {
+    "load_mode": "incremental",
+    "auth_mode": "anonymous",
+    "key_vault_url": "",
+    "secret_name": ""
+  }
 }

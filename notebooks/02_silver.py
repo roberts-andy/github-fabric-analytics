@@ -1,6 +1,7 @@
 import json
 
 import notebookutils
+from delta.tables import DeltaTable
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
@@ -104,6 +105,15 @@ key_columns = {
     "issues": ["repository_id", "item_id"],
     "pull_requests": ["repository_id", "item_id"],
 }
+repository_ids = [r["id"] for r in latest["repositories"]]
+load_plan = latest.get("repository_loads", {
+    str(repository_id): dict.fromkeys(schemas, "full") for repository_id in repository_ids
+})
+if set(load_plan) != {str(repository_id) for repository_id in repository_ids}:
+    raise ValueError("Incremental load plan does not match the repository inventory")
+if any(set(plan) != set(schemas) or set(plan.values()) - {"full", "incremental"}
+       for plan in load_plan.values()):
+    raise ValueError("Invalid repository/entity load mode")
 metrics = {}
 for entity, frame in frames.items():
     condition = F.coalesce(F.expr(rules[entity]), F.lit(False))
@@ -127,14 +137,38 @@ for entity, frame in frames.items():
     cleaned = (
         frame.withColumn("_row", F.row_number().over(window)).where("_row = 1").drop("_row")
     )
-    # This small-repository POC replaces the complete current snapshot, including
-    # valid empty tables; Bronze retains every historical capture.
-    cleaned.write.format("delta").mode("overwrite").option(
-        "overwriteSchema", "true"
-    ).saveAsTable(f"silver.{entity}")
-    spark.sql(f"OPTIMIZE silver.{entity}")
-    actual = spark.table(f"silver.{entity}").count()
-    expected = cleaned.count()
+    full_ids = [int(key) for key, plan in load_plan.items() if plan[entity] == "full"]
+    table = f"silver.{entity}"
+    if spark.catalog.tableExists(table):
+        retained = spark.table(table).where(
+            F.col("repository_id").isin(repository_ids) & ~F.col("repository_id").isin(full_ids)
+        )
+        expected = retained.select(*key_columns[entity]).union(
+            cleaned.select(*key_columns[entity])
+        ).distinct().count()
+        match = " AND ".join(f"target.{key} = source.{key}" for key in key_columns[entity])
+        freshness = "updated_at" if "updated_at" in cleaned.columns else "ingested_at"
+        (
+            DeltaTable.forName(spark, table).alias("target")
+            .merge(cleaned.alias("source"), match)
+            .whenMatchedUpdateAll(condition=(
+                F.col("source.repository_id").isin(full_ids)
+                | (F.col(f"source.{freshness}") >= F.col(f"target.{freshness}"))
+            ))
+            .whenNotMatchedInsertAll()
+            .whenNotMatchedBySourceDelete(condition=(
+                ~F.col("target.repository_id").isin(repository_ids)
+                | F.col("target.repository_id").isin(full_ids)
+            ))
+            .execute()
+        )
+    else:
+        if set(full_ids) != set(repository_ids):
+            raise ValueError(f"{table} is missing; run a full bootstrap before incremental loads")
+        expected = cleaned.count()
+        cleaned.write.format("delta").saveAsTable(table)
+    spark.sql(f"OPTIMIZE {table}")
+    actual = spark.table(table).count()
     if actual != expected:
         raise ValueError(f"Silver {entity} persisted {actual}; expected {expected}")
     metrics[entity] = {"rows": actual, "rejected": rejected_count}

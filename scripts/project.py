@@ -146,13 +146,24 @@ def notebook_definition(path, state):
     import nbformat
 
     source = path.read_text(encoding="utf-8")
+    parameters = {"owner": CONFIG["owner"]}
+    if path.stem == "00_ingest_github":
+        ingestion = CONFIG.get("github_ingestion", {})
+        parameters.update({
+            "github_auth_mode": ingestion.get("auth_mode", "anonymous"),
+            "key_vault_url": ingestion.get("key_vault_url", ""),
+            "github_secret_name": ingestion.get("secret_name", ""),
+            "load_mode": ingestion.get("load_mode", "incremental"),
+        })
+    if path.stem == "04_refresh_semantic_model":
+        parameters["semantic_model_id"] = state.get("semantic_model_id", "")
     notebook = nbformat.v4.new_notebook(
         cells=[
             nbformat.v4.new_markdown_cell(
                 f"# {path.stem.replace('_', ' ')}\nSource owner: {CONFIG['owner']}"
             ),
             nbformat.v4.new_code_cell(
-                f"owner = {json.dumps(CONFIG['owner'])}",
+                "\n".join(f"{key} = {json.dumps(value)}" for key, value in parameters.items()),
                 metadata={"tags": ["parameters"]},
             ),
             nbformat.v4.new_code_cell(source),
@@ -179,7 +190,7 @@ def notebook_definition(path, state):
     }]}
 
 
-def deploy(_args):
+def deploy(args):
     state = load()
     if not state.get("schemas_created"):
         raise RuntimeError("Run bootstrap before deploying layer notebooks")
@@ -188,10 +199,13 @@ def deploy(_args):
     items = api.list(workspace + "/items?type=Notebook")
     state.setdefault("notebooks", {})
     for path in sorted((ROOT / "notebooks").glob("*.py")):
+        if args.notebook and path.stem not in args.notebook:
+            continue
         definition = notebook_definition(path, state)
         name = path.stem
         item = exact(items, name)
         if item:
+            api.call("POST", workspace + f"/notebooks/{item['id']}/getDefinition?format=ipynb", {})
             api.call("POST", workspace + f"/notebooks/{item['id']}/updateDefinition",
                      {"definition": definition})
         else:
@@ -440,7 +454,8 @@ if __name__ == "__main__":
     create = commands.add_parser("provision")
     create.add_argument("--capacity-id", required=True)
     commands.add_parser("bootstrap")
-    commands.add_parser("deploy")
+    upload = commands.add_parser("deploy")
+    upload.add_argument("--notebook", action="append")
     commands.add_parser("stage")
     commands.add_parser("discover")
     execute = commands.add_parser("run")
